@@ -189,13 +189,16 @@ func (d *Daemon) patrol() {
 	// 1. Check health of existing workers
 	d.checkWorkerHealth()
 
-	// 2. Find ready issues (children of in-progress epics)
+	// 2. Check if any in-progress epics are complete (all children closed)
+	d.checkEpicCompletion()
+
+	// 3. Find ready issues (children of in-progress epics)
 	readyIssues := d.findReadyIssues()
 
-	// 3. Spawn workers for unassigned ready issues
+	// 4. Spawn workers for unassigned ready issues
 	d.spawnWorkers(readyIssues)
 
-	// 4. Save state
+	// 5. Save state
 	d.saveState()
 
 	log.Printf("Patrol complete: %d active workers", len(d.workers))
@@ -236,6 +239,72 @@ func (d *Daemon) getInProgressEpics() []Issue {
 	}
 
 	return parseIssuesJSON(output)
+}
+
+// checkEpicCompletion checks if any in-progress epics have all children closed
+func (d *Daemon) checkEpicCompletion() {
+	epics := d.getInProgressEpics()
+
+	for _, epic := range epics {
+		children := d.getEpicChildren(epic.ID)
+		if len(children) == 0 {
+			continue // No children yet
+		}
+
+		allClosed := true
+		for _, child := range children {
+			if child.Status != "closed" {
+				allClosed = false
+				break
+			}
+		}
+
+		if allClosed {
+			log.Printf("Epic %s complete! All %d children closed.", epic.ID, len(children))
+			d.closeEpic(epic)
+			d.notifyEpicComplete(epic)
+		}
+	}
+}
+
+// getEpicChildren returns all children of an epic (any status)
+func (d *Daemon) getEpicChildren(epicID string) []Issue {
+	cmd := exec.Command("bd", "children", epicID, "--json")
+	cmd.Dir = d.config.Workspace
+
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Failed to get children of epic %s: %v", epicID, err)
+		return nil
+	}
+
+	return parseIssuesJSON(output)
+}
+
+// closeEpic marks an epic as closed
+func (d *Daemon) closeEpic(epic Issue) {
+	cmd := exec.Command("bd", "close", epic.ID, "--reason", "All children completed")
+	cmd.Dir = d.config.Workspace
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to close epic %s: %v", epic.ID, err)
+	} else {
+		log.Printf("Closed epic %s: %s", epic.ID, epic.Title)
+	}
+}
+
+// notifyEpicComplete sends a desktop notification
+func (d *Daemon) notifyEpicComplete(epic Issue) {
+	// Use notify-send for Ubuntu/GNOME notifications
+	cmd := exec.Command("notify-send",
+		"--urgency=normal",
+		"--icon=emblem-default",
+		"🎉 Epic Complete!",
+		fmt.Sprintf("%s: %s", epic.ID, epic.Title))
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to send notification: %v", err)
+	}
 }
 
 func (d *Daemon) getReadyIssuesForEpic(epicID string) []Issue {
