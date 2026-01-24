@@ -268,17 +268,31 @@ func (d *Daemon) checkEpicCompletion() {
 }
 
 // getEpicChildren returns all children of an epic (any status)
+// Uses bd show --json and extracts the dependents field
 func (d *Daemon) getEpicChildren(epicID string) []Issue {
-	cmd := exec.Command("bd", "children", epicID, "--json")
+	cmd := exec.Command("bd", "show", epicID, "--json")
 	cmd.Dir = d.config.Workspace
 
 	output, err := cmd.Output()
 	if err != nil {
-		log.Printf("Failed to get children of epic %s: %v", epicID, err)
+		log.Printf("Failed to get epic %s: %v", epicID, err)
 		return nil
 	}
 
-	return parseIssuesJSON(output)
+	// bd show --json returns an array with one element containing dependents
+	var epics []struct {
+		Dependents []Issue `json:"dependents"`
+	}
+	if err := json.Unmarshal(output, &epics); err != nil {
+		log.Printf("Failed to parse epic JSON: %v", err)
+		return nil
+	}
+
+	if len(epics) == 0 {
+		return nil
+	}
+
+	return epics[0].Dependents
 }
 
 // closeEpic marks an epic as closed
