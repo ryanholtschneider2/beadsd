@@ -310,8 +310,9 @@ func (d *Daemon) closeEpic(epic Issue) {
 // notifyEpicComplete sends a desktop notification
 func (d *Daemon) notifyEpicComplete(epic Issue) {
 	// Use notify-send for Ubuntu/GNOME notifications
+	// --urgency=critical makes it persist until dismissed
 	cmd := exec.Command("notify-send",
-		"--urgency=normal",
+		"--urgency=critical",
 		"--icon=emblem-default",
 		"🎉 Epic Complete!",
 		fmt.Sprintf("%s: %s", epic.ID, epic.Title))
