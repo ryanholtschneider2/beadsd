@@ -45,15 +45,16 @@ type Dependency struct {
 
 // Issue represents a beads issue
 type Issue struct {
-	ID           string       `json:"id"`
-	Title        string       `json:"title"`
-	Status       string       `json:"status"`
-	Priority     int          `json:"priority"`
-	Assignee     string       `json:"assignee"`
-	IssueType    string       `json:"issue_type"`
-	ExternalRef  string       `json:"external_ref"`
-	Labels       []string     `json:"labels"`
-	Dependencies []Dependency `json:"dependencies"`
+	ID             string       `json:"id"`
+	Title          string       `json:"title"`
+	Status         string       `json:"status"`
+	Priority       int          `json:"priority"`
+	Assignee       string       `json:"assignee"`
+	IssueType      string       `json:"issue_type"`
+	ExternalRef    string       `json:"external_ref"`
+	Labels         []string     `json:"labels"`
+	Dependencies   []Dependency `json:"dependencies"`
+	DependencyType string       `json:"dependency_type"` // "parent-child" or "blocks" when in dependents list
 }
 
 // GetEpicParent returns the ID of the epic this issue depends on (if any)
@@ -68,13 +69,14 @@ func (i *Issue) GetEpicParent() string {
 
 // Worker represents an active Claude worker
 type Worker struct {
-	IssueID     string    `json:"issue_id"`
-	EpicID      string    `json:"epic_id"`
-	SessionName string    `json:"session_name"` // tmux session (epic-level)
-	WindowName  string    `json:"window_name"`  // tmux window (worker-level)
-	SessionID   string    `json:"session_id"`   // Claude session ID for resume
-	StartedAt   time.Time `json:"started_at"`
-	LastActive  time.Time `json:"last_active"`
+	IssueID      string    `json:"issue_id"`
+	EpicID       string    `json:"epic_id"`
+	SessionName  string    `json:"session_name"` // tmux session (epic-level)
+	WindowName   string    `json:"window_name"`  // tmux window (worker-level)
+	SessionID    string    `json:"session_id"`   // Claude session ID for resume
+	StartedAt    time.Time `json:"started_at"`
+	LastActive   time.Time `json:"last_active"`
+	ResumeErrors int       `json:"resume_errors"` // consecutive resume failures
 }
 
 // Daemon manages the orchestration loop
@@ -245,24 +247,48 @@ func (d *Daemon) getInProgressEpics() []Issue {
 func (d *Daemon) checkEpicCompletion() {
 	epics := d.getInProgressEpics()
 
+	if len(epics) == 0 {
+		// Only log this occasionally to avoid spam
+		return
+	}
+
+	log.Printf("Checking completion for %d in-progress epics", len(epics))
+
 	for _, epic := range epics {
-		children := d.getEpicChildren(epic.ID)
+		allDependents := d.getEpicChildren(epic.ID)
+
+		// Filter to only parent-child relationships (exclude "blocks" which are downstream epics)
+		var children []Issue
+		for _, dep := range allDependents {
+			if dep.DependencyType == "parent-child" {
+				children = append(children, dep)
+			}
+		}
+
 		if len(children) == 0 {
+			log.Printf("Epic %s has no parent-child dependents (total dependents: %d)", epic.ID, len(allDependents))
 			continue // No children yet
 		}
 
 		allClosed := true
+		var openChildren []string
+		var closedChildren []string
 		for _, child := range children {
 			if child.Status != "closed" {
 				allClosed = false
-				break
+				openChildren = append(openChildren, child.ID)
+			} else {
+				closedChildren = append(closedChildren, child.ID)
 			}
 		}
 
 		if allClosed {
-			log.Printf("Epic %s complete! All %d children closed.", epic.ID, len(children))
+			log.Printf("Epic %s complete! All %d children closed: %v", epic.ID, len(children), closedChildren)
 			d.closeEpic(epic)
 			d.notifyEpicComplete(epic)
+		} else {
+			// Always log progress for in-progress epics
+			log.Printf("Epic %s: %d/%d children closed (open: %v)", epic.ID, len(closedChildren), len(children), openChildren)
 		}
 	}
 }
@@ -374,6 +400,13 @@ func (d *Daemon) spawnWorkers(issues []Issue) {
 
 		// Skip if already have a worker for this issue
 		if _, exists := d.workers[issue.ID]; exists {
+			log.Printf("Skipping %s: already have a worker in map", issue.ID)
+			continue
+		}
+
+		// Double-check issue status before spawning (prevents race with bd ready cache)
+		if d.isIssueInProgress(issue.ID) {
+			log.Printf("Skipping %s: already in_progress (claimed by another process)", issue.ID)
 			continue
 		}
 
@@ -394,16 +427,9 @@ func (d *Daemon) spawnWorker(issue Issue) (*Worker, error) {
 	sessionID := uuid.New().String()
 	epicID := issue.GetEpicParent()
 
-	// Use full ID if shorter than limit, otherwise truncate
-	epicSuffix := epicID
-	if len(epicID) > 8 {
-		epicSuffix = epicID[:8]
-	}
+	// Use full IDs - tmux supports long names and truncation causes collisions
 	windowName := issue.ID
-	if len(issue.ID) > 12 {
-		windowName = issue.ID[:12]
-	}
-	sessionName := fmt.Sprintf("beadsd-%s", epicSuffix)  // tmux session per epic
+	sessionName := fmt.Sprintf("beadsd-%s", epicID)
 
 	// Claim the issue
 	claimCmd := exec.Command("bd", "update", issue.ID,
@@ -456,21 +482,50 @@ func (d *Daemon) checkWorkerHealth() {
 		// Check if tmux window exists (session:window format)
 		windowTarget := fmt.Sprintf("%s:%s", worker.SessionName, worker.WindowName)
 
-		if !d.tmuxWindowExists(worker.SessionName, worker.WindowName) {
-			// Window died - check if issue was closed
-			if d.isIssueClosed(issueID) {
-				log.Printf("Worker %s completed issue %s", worker.WindowName, issueID)
-				delete(d.workers, issueID)
+		windowExists := d.tmuxWindowExists(worker.SessionName, worker.WindowName)
+		claudeRunning := windowExists && d.isClaudeRunning(worker.SessionName, worker.WindowName)
+
+		// First check: Is the issue already closed?
+		// If closed, remove worker regardless of whether Claude is still running
+		// (user may have closed issue manually while session is open)
+		if d.isIssueClosed(issueID) {
+			log.Printf("Worker %s: issue %s is closed, removing from tracking", worker.WindowName, issueID)
+			// Don't kill the window - let user keep it open for reference
+			delete(d.workers, issueID)
+			continue
+		}
+
+		if !windowExists || !claudeRunning {
+			// Guard: don't act on workers that just started (allow 60s for Claude to boot)
+			if time.Since(worker.StartedAt) < 60*time.Second {
+				log.Printf("Worker %s for issue %s is still booting (started %s ago), skipping health check",
+					worker.WindowName, issueID, time.Since(worker.StartedAt).Round(time.Second))
 				continue
 			}
 
-			// Window died but issue not closed - resume
-			log.Printf("Worker %s died for issue %s, resuming...", worker.WindowName, issueID)
+			// Window died or Claude exited but issue not closed - resume
+			reason := "window died"
+			if windowExists && !claudeRunning {
+				reason = "Claude exited"
+				// Kill the lingering bash window before resuming
+				d.killTmuxWindow(worker.SessionName, worker.WindowName)
+			}
+			log.Printf("Worker %s %s for issue %s, resuming...", worker.WindowName, reason, issueID)
 			if err := d.resumeWorker(worker); err != nil {
-				log.Printf("Failed to resume worker: %v", err)
-				// Clear assignee so it can be picked up again
-				d.clearAssignee(issueID)
-				delete(d.workers, issueID)
+				worker.ResumeErrors++
+				log.Printf("Failed to resume worker (attempt %d/3): %v", worker.ResumeErrors, err)
+				if worker.ResumeErrors >= 3 {
+					log.Printf("Worker %s failed to resume 3 times, releasing issue %s", worker.WindowName, issueID)
+					d.clearAssignee(issueID)
+					delete(d.workers, issueID)
+				} else {
+					log.Printf("Keeping issue %s claimed to prevent duplicate spawn. Will retry next patrol.", issueID)
+				}
+			} else {
+				// Resume succeeded — reset error count and update start time so boot guard applies
+				worker.ResumeErrors = 0
+				worker.StartedAt = time.Now()
+				worker.LastActive = time.Now()
 			}
 			continue
 		}
@@ -490,6 +545,14 @@ func (d *Daemon) tmuxSessionExists(name string) bool {
 	return cmd.Run() == nil
 }
 
+func (d *Daemon) killTmuxWindow(sessionName, windowName string) {
+	target := fmt.Sprintf("%s:%s", sessionName, windowName)
+	cmd := exec.Command("tmux", "kill-window", "-t", target)
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to kill tmux window %s: %v", target, err)
+	}
+}
+
 func (d *Daemon) tmuxWindowExists(sessionName, windowName string) bool {
 	// List windows in the session and check if our window name exists
 	cmd := exec.Command("tmux", "list-windows", "-t", sessionName, "-F", "#{window_name}")
@@ -505,6 +568,41 @@ func (d *Daemon) tmuxWindowExists(sessionName, windowName string) bool {
 		}
 	}
 	return false
+}
+
+// isClaudeRunning checks if Claude is actually running in the tmux window
+// (not just that the window exists with bash after Claude exited)
+func (d *Daemon) isClaudeRunning(sessionName, windowName string) bool {
+	target := fmt.Sprintf("%s:%s", sessionName, windowName)
+
+	// Check pane_current_command for known Claude process names
+	cmd := exec.Command("tmux", "display-message", "-t", target, "-p", "#{pane_current_command}")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	proc := strings.TrimSpace(string(output))
+	// "script" wraps Claude (PTY allocation), "node" is Claude's runtime,
+	// "claude" is the direct process name, "bash" could be startup phase
+	if proc == "script" || proc == "node" || proc == "claude" {
+		return true
+	}
+
+	// Fallback: check if any claude/node process exists in the pane's process tree
+	// This catches cases where pane_current_command reports a different name
+	pidCmd := exec.Command("tmux", "display-message", "-t", target, "-p", "#{pane_pid}")
+	pidOutput, err := pidCmd.Output()
+	if err != nil {
+		return false
+	}
+	pid := strings.TrimSpace(string(pidOutput))
+	if pid == "" {
+		return false
+	}
+
+	// Check if any descendant process is claude or node
+	psCmd := exec.Command("bash", "-c", fmt.Sprintf("pstree -p %s 2>/dev/null | grep -qE 'claude|node'", pid))
+	return psCmd.Run() == nil
 }
 
 func (d *Daemon) getWindowLastActivity(windowTarget string) time.Time {
@@ -571,6 +669,28 @@ func (d *Daemon) isIssueClosed(issueID string) bool {
 	}
 
 	return issues[0].Status == "closed"
+}
+
+// isIssueInProgress checks if an issue is already claimed/in_progress
+func (d *Daemon) isIssueInProgress(issueID string) bool {
+	cmd := exec.Command("bd", "show", issueID, "--json")
+	cmd.Dir = d.config.Workspace
+
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+
+	var issues []Issue
+	if err := json.Unmarshal(output, &issues); err != nil {
+		return false
+	}
+
+	if len(issues) == 0 {
+		return false
+	}
+
+	return issues[0].Status == "in_progress"
 }
 
 func (d *Daemon) resumeWorker(worker *Worker) error {
