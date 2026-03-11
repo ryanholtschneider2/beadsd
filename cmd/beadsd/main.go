@@ -53,6 +53,7 @@ type Issue struct {
 	IssueType      string       `json:"issue_type"`
 	ExternalRef    string       `json:"external_ref"`
 	Labels         []string     `json:"labels"`
+	Notes          string       `json:"notes"`
 	Dependencies   []Dependency `json:"dependencies"`
 	DependencyType string       `json:"dependency_type"` // "parent-child" or "blocks" when in dependents list
 }
@@ -65,6 +66,22 @@ func (i *Issue) GetEpicParent() string {
 		}
 	}
 	return ""
+}
+
+// GetWorkflow returns the workflow type from the notes field ("software" or "general")
+func (i *Issue) GetWorkflow() string {
+	if strings.Contains(i.Notes, "workflow:general") {
+		return "general"
+	}
+	return "software"
+}
+
+// SlashCommand returns the appropriate slash command for this workflow type
+func (i *Issue) SlashCommand() string {
+	if i.GetWorkflow() == "general" {
+		return "/beads-task"
+	}
+	return "/beads-issue"
 }
 
 // Worker represents an active Claude worker
@@ -81,10 +98,11 @@ type Worker struct {
 
 // Daemon manages the orchestration loop
 type Daemon struct {
-	config  Config
-	workers map[string]*Worker // issueID -> Worker
-	mu      sync.RWMutex
-	stop    chan struct{}
+	config        Config
+	workers       map[string]*Worker // issueID -> Worker
+	epicWorkflows map[string]string  // epicID -> workflow type ("software" or "general")
+	mu            sync.RWMutex
+	stop          chan struct{}
 }
 
 func main() {
@@ -154,9 +172,10 @@ func parseFlags() Config {
 
 func NewDaemon(config Config) *Daemon {
 	d := &Daemon{
-		config:  config,
-		workers: make(map[string]*Worker),
-		stop:    make(chan struct{}),
+		config:        config,
+		workers:       make(map[string]*Worker),
+		epicWorkflows: make(map[string]string),
+		stop:          make(chan struct{}),
 	}
 	d.loadState()
 	return d
@@ -218,6 +237,9 @@ func (d *Daemon) findReadyIssues() []Issue {
 	// For each in-progress epic, get ready issues under it
 	var allReady []Issue
 	for _, epic := range inProgressEpics {
+		// Cache the epic's workflow type
+		d.epicWorkflows[epic.ID] = epic.GetWorkflow()
+
 		issues := d.getReadyIssuesForEpic(epic.ID)
 		for i := range issues {
 			// Store epic ID for tmux session grouping
@@ -441,11 +463,17 @@ func (d *Daemon) spawnWorker(issue Issue) (*Worker, error) {
 		return nil, fmt.Errorf("failed to claim issue: %w", err)
 	}
 
+	// Determine slash command based on epic's workflow type
+	slashCmd := "/beads-issue"
+	if workflow, ok := d.epicWorkflows[epicID]; ok && workflow == "general" {
+		slashCmd = "/beads-task"
+	}
+
 	// Build the Claude command (interactive session with initial prompt)
 	// --dangerously-skip-permissions bypasses trust prompt for automated workers
 	// Use script -q to force PTY allocation for smooth streaming output
-	claudeCmd := fmt.Sprintf("cd %s && script -q -c 'claude --dangerously-skip-permissions --session-id %s \"/beads-issue %s\"' /dev/null; echo 'Claude exited with code '$?; read -p 'Press enter to close...'",
-		d.config.Workspace, sessionID, issue.ID)
+	claudeCmd := fmt.Sprintf("cd %s && script -q -c 'claude --dangerously-skip-permissions --session-id %s \"%s %s\"' /dev/null; echo 'Claude exited with code '$?; read -p 'Press enter to close...'",
+		d.config.Workspace, sessionID, slashCmd, issue.ID)
 
 	// Check if epic's tmux session exists
 	if d.tmuxSessionExists(sessionName) {
@@ -718,7 +746,13 @@ func (d *Daemon) nudgeWorker(worker *Worker) {
 	message := fmt.Sprintf("Status check: Are you still working on %s? Use 'bd close %s' when done.",
 		worker.IssueID, worker.IssueID)
 
-	cmd := exec.Command("tmux", "send-keys", "-t", windowTarget, message, "Enter")
+	cmd := exec.Command("tmux", "send-keys", "-t", windowTarget, "-l", message)
+	if err := cmd.Run(); err != nil {
+		log.Printf("Failed to nudge worker %s: %v", worker.WindowName, err)
+		return
+	}
+	// Send Enter separately since -l flag treats everything as literal text
+	cmd = exec.Command("tmux", "send-keys", "-t", windowTarget, "Enter")
 	if err := cmd.Run(); err != nil {
 		log.Printf("Failed to nudge worker %s: %v", worker.WindowName, err)
 	}
