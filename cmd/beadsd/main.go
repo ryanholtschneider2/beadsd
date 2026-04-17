@@ -29,11 +29,13 @@ import (
 
 // Config holds daemon configuration
 type Config struct {
-	Workspace    string
-	MaxWorkers   int
-	PollInterval time.Duration
-	IdleTimeout  time.Duration
-	StateFile    string
+	Workspace         string
+	MaxWorkers        int
+	PollInterval      time.Duration
+	IdleTimeout       time.Duration
+	StateFile         string
+	MaxFailedNudges   int           // rocks-project-w1f: kill+reset after N failed nudges in a row
+	IdleKillThreshold time.Duration // rocks-project-w1f: hard timeout — kill regardless of nudge state
 }
 
 // Dependency represents a beads dependency
@@ -93,7 +95,8 @@ type Worker struct {
 	SessionID    string    `json:"session_id"`   // Claude session ID for resume
 	StartedAt    time.Time `json:"started_at"`
 	LastActive   time.Time `json:"last_active"`
-	ResumeErrors int       `json:"resume_errors"` // consecutive resume failures
+	ResumeErrors int       `json:"resume_errors"`  // consecutive resume failures
+	FailedNudges int       `json:"failed_nudges"`  // rocks-project-w1f: consecutive failed nudge attempts
 }
 
 // Daemon manages the orchestration loop
@@ -152,6 +155,8 @@ func parseFlags() Config {
 	maxWorkers := flag.Int("max-workers", 3, "Maximum concurrent workers")
 	pollInterval := flag.Duration("poll-interval", 30*time.Second, "Poll interval for checking ready issues")
 	idleTimeout := flag.Duration("idle-timeout", 10*time.Minute, "Time before considering a worker idle")
+	maxFailedNudges := flag.Int("max-failed-nudges", 3, "Kill+reset a worker after this many consecutive failed nudges (rocks-project-w1f)")
+	idleKillThreshold := flag.Duration("idle-kill-threshold", 60*time.Minute, "Hard timeout — kill+reset any worker idle longer than this regardless of nudge state (rocks-project-w1f)")
 
 	flag.Parse()
 
@@ -162,11 +167,13 @@ func parseFlags() Config {
 	}
 
 	return Config{
-		Workspace:    absWorkspace,
-		MaxWorkers:   *maxWorkers,
-		PollInterval: *pollInterval,
-		IdleTimeout:  *idleTimeout,
-		StateFile:    filepath.Join(absWorkspace, ".beads", "daemon-state.json"),
+		Workspace:         absWorkspace,
+		MaxWorkers:        *maxWorkers,
+		PollInterval:      *pollInterval,
+		IdleTimeout:       *idleTimeout,
+		MaxFailedNudges:   *maxFailedNudges,
+		IdleKillThreshold: *idleKillThreshold,
+		StateFile:         filepath.Join(absWorkspace, ".beads", "daemon-state.json"),
 	}
 }
 
@@ -380,7 +387,17 @@ func (d *Daemon) getReadyIssuesForEpic(epicID string) []Issue {
 		return nil
 	}
 
-	return parseIssuesJSON(output)
+	// Exclude sub-epics — epics need decomposition into children, not a /beads-issue worker.
+	all := parseIssuesJSON(output)
+	filtered := make([]Issue, 0, len(all))
+	for _, issue := range all {
+		if issue.IssueType == "epic" {
+			log.Printf("Skipping sub-epic %s under %s: epics are not implemented by workers", issue.ID, epicID)
+			continue
+		}
+		filtered = append(filtered, issue)
+	}
+	return filtered
 }
 
 func parseIssuesJSON(data []byte) []Issue {
@@ -558,12 +575,47 @@ func (d *Daemon) checkWorkerHealth() {
 			continue
 		}
 
-		// Check if window is idle (no output for too long)
+		// Check if window is idle (no output for too long).
+		// rocks-project-w1f: layered escalation — soft path is nudge, hard path
+		// is unconditional kill+reset after IdleKillThreshold so a stuck worker
+		// can never permanently block its slot.
 		lastActivity := d.getWindowLastActivity(windowTarget)
-		if time.Since(lastActivity) > d.config.IdleTimeout {
-			log.Printf("Worker %s idle for %s, nudging...", worker.WindowName, time.Since(lastActivity))
-			d.nudgeWorker(worker)
-			worker.LastActive = time.Now() // Reset to avoid repeated nudges
+		idleDuration := time.Since(lastActivity)
+
+		// Hard timeout: kill+reset regardless of nudge state. This catches the
+		// case where nudges are silently failing or the worker is wedged in a
+		// way that ignores stdin.
+		if idleDuration > d.config.IdleKillThreshold {
+			d.killAndResetWorker(
+				issueID,
+				worker,
+				fmt.Sprintf("hard idle timeout (%s > %s)",
+					idleDuration.Round(time.Second), d.config.IdleKillThreshold),
+			)
+			continue
+		}
+
+		// Soft path: nudge once per idle window, escalate after N consecutive failures.
+		if idleDuration > d.config.IdleTimeout {
+			log.Printf("Worker %s idle for %s, nudging (failed nudges: %d/%d)...",
+				worker.WindowName, idleDuration.Round(time.Second),
+				worker.FailedNudges, d.config.MaxFailedNudges)
+			if err := d.nudgeWorker(worker); err != nil {
+				worker.FailedNudges++
+				if worker.FailedNudges >= d.config.MaxFailedNudges {
+					d.killAndResetWorker(
+						issueID,
+						worker,
+						fmt.Sprintf("%d consecutive failed nudges", worker.FailedNudges),
+					)
+					continue
+				}
+			} else {
+				// Successful nudge resets the counter. The worker may still
+				// not respond, but the hard idle timeout will catch that.
+				worker.FailedNudges = 0
+			}
+			worker.LastActive = time.Now() // Reset to avoid re-nudging next patrol
 		}
 	}
 }
@@ -740,8 +792,10 @@ func (d *Daemon) resumeWorker(worker *Worker) error {
 	return tmuxCmd.Run()
 }
 
-func (d *Daemon) nudgeWorker(worker *Worker) {
-	// Send a message to the specific tmux window
+// nudgeWorker sends a status-check prompt to the worker's tmux window.
+// Returns nil on success, or an error if either send-keys command failed.
+// Callers track the error for escalation (rocks-project-w1f).
+func (d *Daemon) nudgeWorker(worker *Worker) error {
 	windowTarget := fmt.Sprintf("%s:%s", worker.SessionName, worker.WindowName)
 	message := fmt.Sprintf("Status check: Are you still working on %s? Use 'bd close %s' when done.",
 		worker.IssueID, worker.IssueID)
@@ -749,13 +803,27 @@ func (d *Daemon) nudgeWorker(worker *Worker) {
 	cmd := exec.Command("tmux", "send-keys", "-t", windowTarget, "-l", message)
 	if err := cmd.Run(); err != nil {
 		log.Printf("Failed to nudge worker %s: %v", worker.WindowName, err)
-		return
+		return fmt.Errorf("send message to %s: %w", windowTarget, err)
 	}
 	// Send Enter separately since -l flag treats everything as literal text
 	cmd = exec.Command("tmux", "send-keys", "-t", windowTarget, "Enter")
 	if err := cmd.Run(); err != nil {
 		log.Printf("Failed to nudge worker %s: %v", worker.WindowName, err)
+		return fmt.Errorf("send Enter to %s: %w", windowTarget, err)
 	}
+	return nil
+}
+
+// killAndResetWorker kills the worker's tmux window, releases its claim on the
+// beads issue, and removes it from tracking. Used when escalation thresholds
+// are crossed (rocks-project-w1f) so a stuck worker frees up its slot for the
+// dispatch queue. Caller must hold d.mu.
+func (d *Daemon) killAndResetWorker(issueID string, worker *Worker, reason string) {
+	log.Printf("ESCALATING worker %s (issue %s): %s — killing tmux window and releasing assignee",
+		worker.WindowName, issueID, reason)
+	d.killTmuxWindow(worker.SessionName, worker.WindowName)
+	d.clearAssignee(issueID)
+	delete(d.workers, issueID)
 }
 
 func (d *Daemon) clearAssignee(issueID string) {
