@@ -5,7 +5,8 @@
 // Detects idle/dead workers and resumes them using session IDs.
 //
 // Usage:
-//   beadsd [--workspace /path/to/workspace] [--max-workers 3] [--poll-interval 30s]
+//
+//	beadsd [--workspace /path/to/workspace] [--max-workers 3] [--poll-interval 30s]
 package main
 
 import (
@@ -88,15 +89,27 @@ func (i *Issue) SlashCommand() string {
 
 // Worker represents an active Claude worker
 type Worker struct {
+	IssueID          string    `json:"issue_id"`
+	EpicID           string    `json:"epic_id"`
+	SessionName      string    `json:"session_name"` // tmux session (epic-level)
+	WindowName       string    `json:"window_name"`  // tmux window (worker-level)
+	SessionID        string    `json:"session_id"`   // Claude session ID for resume
+	StartedAt        time.Time `json:"started_at"`
+	LastActive       time.Time `json:"last_active"`
+	ResumeErrors     int       `json:"resume_errors"`      // consecutive resume failures
+	FailedNudges     int       `json:"failed_nudges"`      // rocks-project-w1f: consecutive failed nudge attempts
+	LastNudgeAt      time.Time `json:"last_nudge_at"`      // when we last sent a nudge (to discount nudge-induced window activity)
+	PreNudgeActivity time.Time `json:"pre_nudge_activity"` // window activity snapshot BEFORE last nudge
+}
+
+// DispatchEntry is a queued request to spawn a worker on a specific issue at
+// (or after) a scheduled time. Written by `beadsd dispatch` and drained by the
+// daemon's patrol loop.
+type DispatchEntry struct {
 	IssueID      string    `json:"issue_id"`
-	EpicID       string    `json:"epic_id"`
-	SessionName  string    `json:"session_name"` // tmux session (epic-level)
-	WindowName   string    `json:"window_name"`  // tmux window (worker-level)
-	SessionID    string    `json:"session_id"`   // Claude session ID for resume
-	StartedAt    time.Time `json:"started_at"`
-	LastActive   time.Time `json:"last_active"`
-	ResumeErrors int       `json:"resume_errors"`  // consecutive resume failures
-	FailedNudges int       `json:"failed_nudges"`  // rocks-project-w1f: consecutive failed nudge attempts
+	ScheduledFor time.Time `json:"scheduled_for"`
+	Skill        string    `json:"skill"`
+	QueuedAt     time.Time `json:"queued_at"`
 }
 
 // Daemon manages the orchestration loop
@@ -109,6 +122,13 @@ type Daemon struct {
 }
 
 func main() {
+	// Subcommand dispatch: `beadsd dispatch [--time MMDDYYYY-HH:MM] [--skill CMD] <issue-id>...`
+	// Writes entries to .beads/dispatch-queue.json; the running daemon picks them up on patrol.
+	if len(os.Args) > 1 && os.Args[1] == "dispatch" {
+		runDispatchCommand(os.Args[2:])
+		return
+	}
+
 	config := parseFlags()
 
 	// Ensure workspace exists
@@ -220,13 +240,16 @@ func (d *Daemon) patrol() {
 	// 2. Check if any in-progress epics are complete (all children closed)
 	d.checkEpicCompletion()
 
-	// 3. Find ready issues (children of in-progress epics)
+	// 3. Drain dispatch queue (scheduled / manual dispatches)
+	d.processDispatchQueue()
+
+	// 4. Find ready issues (children of in-progress epics)
 	readyIssues := d.findReadyIssues()
 
-	// 4. Spawn workers for unassigned ready issues
+	// 5. Spawn workers for unassigned ready issues
 	d.spawnWorkers(readyIssues)
 
-	// 5. Save state
+	// 6. Save state
 	d.saveState()
 
 	log.Printf("Patrol complete: %d active workers", len(d.workers))
@@ -580,6 +603,17 @@ func (d *Daemon) checkWorkerHealth() {
 		// is unconditional kill+reset after IdleKillThreshold so a stuck worker
 		// can never permanently block its slot.
 		lastActivity := d.getWindowLastActivity(windowTarget)
+		// Discount nudge-induced activity. tmux's window_activity updates on any
+		// pane output, including our own send-keys echo. If the most recent
+		// activity timestamp falls inside the window where our last nudge could
+		// have produced it (and nothing newer has happened since), fall back to
+		// the pre-nudge snapshot. Without this the hard IdleKillThreshold can
+		// never fire on a wedged worker because every patrol's nudge resets the
+		// clock.
+		if !worker.LastNudgeAt.IsZero() && !worker.PreNudgeActivity.IsZero() &&
+			!lastActivity.After(worker.LastNudgeAt.Add(5*time.Second)) {
+			lastActivity = worker.PreNudgeActivity
+		}
 		idleDuration := time.Since(lastActivity)
 
 		// Hard timeout: kill+reset regardless of nudge state. This catches the
@@ -792,11 +826,55 @@ func (d *Daemon) resumeWorker(worker *Worker) error {
 	return tmuxCmd.Run()
 }
 
+// resolveWindowID looks up the tmux @window-id for a (session, window-name) pair.
+// Targeting by @id avoids the dot-as-pane-separator parse in "session:window.pane"
+// syntax for window names that contain periods.
+func (d *Daemon) resolveWindowID(session, windowName string) (string, error) {
+	out, err := exec.Command("tmux", "list-windows", "-t", session,
+		"-F", "#{window_id} #{window_name}").Output()
+	if err != nil {
+		return "", fmt.Errorf("list windows in %s: %w", session, err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) == 2 && parts[1] == windowName {
+			return parts[0], nil
+		}
+	}
+	return "", fmt.Errorf("window %q not found in session %s", windowName, session)
+}
+
 // nudgeWorker sends a status-check prompt to the worker's tmux window.
 // Returns nil on success, or an error if either send-keys command failed.
 // Callers track the error for escalation (rocks-project-w1f).
 func (d *Daemon) nudgeWorker(worker *Worker) error {
-	windowTarget := fmt.Sprintf("%s:%s", worker.SessionName, worker.WindowName)
+	// Resolve window name to its tmux @window-id. Window names containing "."
+	// (e.g. "pd-n44.1") break the default session:window target syntax because
+	// tmux parses the dot as a window.pane separator. @window-id is dot-safe.
+	windowTarget, err := d.resolveWindowID(worker.SessionName, worker.WindowName)
+	if err != nil {
+		log.Printf("Failed to nudge worker %s: %v", worker.WindowName, err)
+		return err
+	}
+
+	// Modal gate: if the pane is blocked on a modal prompt (resume-session
+	// dialog, numbered-select, etc.), send-keys text will just pile into the
+	// input buffer without being processed by Claude. Return an error so the
+	// caller escalates straight to kill+reset instead of sending yet another
+	// status-check line.
+	if paneContent, capErr := d.capturePane(windowTarget); capErr == nil {
+		if modal, blocked := isPaneBlockedByModal(paneContent); blocked {
+			log.Printf("Worker %s blocked by modal %q — skipping nudge, escalating",
+				worker.WindowName, modal)
+			return fmt.Errorf("pane blocked by modal: %s", modal)
+		}
+	}
+
+	// Snapshot pre-nudge activity so checkWorkerHealth can discount the
+	// activity our own send-keys will trigger on the next patrol.
+	worker.PreNudgeActivity = d.getWindowLastActivity(windowTarget)
+	worker.LastNudgeAt = time.Now()
+
 	message := fmt.Sprintf("Status check: Are you still working on %s? Use 'bd close %s' when done.",
 		worker.IssueID, worker.IssueID)
 
@@ -862,4 +940,250 @@ func (d *Daemon) saveState() {
 	if err := os.WriteFile(d.config.StateFile, data, 0644); err != nil {
 		log.Printf("Failed to save state: %v", err)
 	}
+}
+
+// dispatchTimeLayout is the expected format for --time on `beadsd dispatch`.
+// MMDDYYYY-HH:MM, 24-hour. Example: "04212026-15:30".
+const dispatchTimeLayout = "01022006-15:04"
+
+// runDispatchCommand implements the `beadsd dispatch` CLI subcommand.
+func runDispatchCommand(args []string) {
+	fs := flag.NewFlagSet("dispatch", flag.ExitOnError)
+	timeFlag := fs.String("time", "", "Schedule dispatch for MMDDYYYY-HH:MM in EST (24-hour). Default: now.")
+	skillFlag := fs.String("skill", "", "Slash command to invoke (default: /beads-issue, or /beads-task for general workflow issues)")
+	workspaceFlag := fs.String("workspace", ".", "Workspace root directory (must contain .beads/)")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: beadsd dispatch [--time MMDDYYYY-HH:MM] [--skill CMD] [--workspace DIR] <issue-id>...\n\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		os.Exit(2)
+	}
+	issueIDs := fs.Args()
+	if len(issueIDs) == 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	var scheduledFor time.Time
+	if *timeFlag == "" {
+		scheduledFor = time.Now()
+	} else {
+		est := time.FixedZone("EST", -5*3600)
+		t, err := time.ParseInLocation(dispatchTimeLayout, *timeFlag, est)
+		if err != nil {
+			log.Fatalf("Invalid --time %q (expected MMDDYYYY-HH:MM, e.g. 04212026-15:30): %v", *timeFlag, err)
+		}
+		scheduledFor = t
+	}
+
+	absWorkspace, err := filepath.Abs(*workspaceFlag)
+	if err != nil {
+		log.Fatalf("Failed to resolve workspace path: %v", err)
+	}
+	beadsDir := filepath.Join(absWorkspace, ".beads")
+	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+		log.Fatalf("No .beads directory in workspace: %s", absWorkspace)
+	}
+	queuePath := filepath.Join(beadsDir, "dispatch-queue.json")
+
+	entries := loadDispatchQueue(queuePath)
+	now := time.Now()
+	for _, id := range issueIDs {
+		entries = append(entries, DispatchEntry{
+			IssueID:      id,
+			ScheduledFor: scheduledFor,
+			Skill:        *skillFlag,
+			QueuedAt:     now,
+		})
+	}
+	if err := saveDispatchQueue(queuePath, entries); err != nil {
+		log.Fatalf("Failed to write dispatch queue: %v", err)
+	}
+
+	skillLabel := *skillFlag
+	if skillLabel == "" {
+		skillLabel = "(auto)"
+	}
+	for _, id := range issueIDs {
+		fmt.Printf("Queued dispatch: %s at %s (skill: %s)\n",
+			id, scheduledFor.Format(time.RFC3339), skillLabel)
+	}
+}
+
+func loadDispatchQueue(path string) []DispatchEntry {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var entries []DispatchEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("Failed to parse dispatch queue %s: %v", path, err)
+		return nil
+	}
+	return entries
+}
+
+func saveDispatchQueue(path string, entries []DispatchEntry) error {
+	if len(entries) == 0 {
+		// Remove the file entirely so an empty queue has no lingering state.
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		}
+		return os.Remove(path)
+	}
+	data, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// processDispatchQueue drains due entries from .beads/dispatch-queue.json and
+// spawns workers for them. Unspawnable entries (at max capacity, spawn error)
+// are left in the queue for a later patrol.
+func (d *Daemon) processDispatchQueue() {
+	queuePath := filepath.Join(d.config.Workspace, ".beads", "dispatch-queue.json")
+	entries := loadDispatchQueue(queuePath)
+	if len(entries) == 0 {
+		return
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	var remaining []DispatchEntry
+	for _, entry := range entries {
+		if entry.ScheduledFor.After(now) {
+			remaining = append(remaining, entry)
+			continue
+		}
+		if len(d.workers) >= d.config.MaxWorkers {
+			log.Printf("Dispatch queue: at max workers, deferring %s", entry.IssueID)
+			remaining = append(remaining, entry)
+			continue
+		}
+		if _, exists := d.workers[entry.IssueID]; exists {
+			log.Printf("Dispatch queue: %s already has a worker, dropping entry", entry.IssueID)
+			continue
+		}
+		if d.isIssueClosed(entry.IssueID) {
+			log.Printf("Dispatch queue: %s is closed, dropping entry", entry.IssueID)
+			continue
+		}
+		if d.isIssueInProgress(entry.IssueID) {
+			log.Printf("Dispatch queue: %s already in_progress elsewhere, dropping entry", entry.IssueID)
+			continue
+		}
+		worker, err := d.spawnDispatchedWorker(entry.IssueID, entry.Skill)
+		if err != nil {
+			log.Printf("Dispatch queue: failed to spawn %s: %v (will retry)", entry.IssueID, err)
+			remaining = append(remaining, entry)
+			continue
+		}
+		d.workers[entry.IssueID] = worker
+		log.Printf("Dispatch queue: spawned worker for %s (scheduled %s)",
+			entry.IssueID, entry.ScheduledFor.Format(time.RFC3339))
+	}
+
+	if err := saveDispatchQueue(queuePath, remaining); err != nil {
+		log.Printf("Failed to save dispatch queue: %v", err)
+	}
+}
+
+// spawnDispatchedWorker spawns a worker for an ad-hoc dispatched issue. Unlike
+// spawnWorker it does not require the issue's parent epic to be in_progress —
+// standalone issues go under the "beadsd-dispatch" tmux session; issues that
+// do have an epic parent still group under beadsd-<epicID>.
+func (d *Daemon) spawnDispatchedWorker(issueID, skill string) (*Worker, error) {
+	cmd := exec.Command("bd", "show", issueID, "--json")
+	cmd.Dir = d.config.Workspace
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("bd show %s: %w", issueID, err)
+	}
+	var issues []Issue
+	if err := json.Unmarshal(output, &issues); err != nil {
+		return nil, fmt.Errorf("parse bd show output: %w", err)
+	}
+	if len(issues) == 0 {
+		return nil, fmt.Errorf("issue %s not found", issueID)
+	}
+	issue := issues[0]
+
+	sessionID := uuid.New().String()
+	epicID := issue.GetEpicParent()
+	windowName := issue.ID
+	sessionName := "beadsd-dispatch"
+	if epicID != "" {
+		sessionName = fmt.Sprintf("beadsd-%s", epicID)
+	}
+
+	slashCmd := skill
+	if slashCmd == "" {
+		slashCmd = issue.SlashCommand()
+	}
+
+	claimCmd := exec.Command("bd", "update", issueID,
+		"--assignee", windowName,
+		"--status", "in_progress",
+		"--external-ref", fmt.Sprintf("session:%s", sessionID))
+	claimCmd.Dir = d.config.Workspace
+	if err := claimCmd.Run(); err != nil {
+		return nil, fmt.Errorf("claim issue: %w", err)
+	}
+
+	claudeCmd := fmt.Sprintf("cd %s && script -q -c 'claude --dangerously-skip-permissions --session-id %s \"%s %s\"' /dev/null; echo 'Claude exited with code '$?; read -p 'Press enter to close...'",
+		d.config.Workspace, sessionID, slashCmd, issueID)
+
+	if d.tmuxSessionExists(sessionName) {
+		tmuxCmd := exec.Command("tmux", "new-window", "-t", sessionName, "-n", windowName, "bash", "-c", claudeCmd)
+		if err := tmuxCmd.Run(); err != nil {
+			return nil, fmt.Errorf("add tmux window: %w", err)
+		}
+	} else {
+		tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", sessionName, "-n", windowName, "bash", "-c", claudeCmd)
+		if err := tmuxCmd.Run(); err != nil {
+			return nil, fmt.Errorf("spawn tmux session: %w", err)
+		}
+	}
+
+	return &Worker{
+		IssueID:     issue.ID,
+		EpicID:      epicID,
+		SessionName: sessionName,
+		WindowName:  windowName,
+		SessionID:   sessionID,
+		StartedAt:   time.Now(),
+		LastActive:  time.Now(),
+	}, nil
+}
+
+// capturePane returns the currently visible content of a tmux pane. Used to
+// detect modal prompts that would swallow nudge keystrokes.
+func (d *Daemon) capturePane(target string) (string, error) {
+	out, err := exec.Command("tmux", "capture-pane", "-p", "-t", target).Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// isPaneBlockedByModal scans visible pane content for known Claude Code modal
+// prompts. When a modal is up, the composer/Enter is intercepted and any
+// send-keys input just piles into the input buffer unprocessed — the caller
+// should escalate straight to kill+reset instead of nudging again.
+func isPaneBlockedByModal(content string) (string, bool) {
+	modals := []string{
+		"Resume from summary",
+		"Resume full session as-is",
+		"Enter to confirm · Esc to cancel",
+	}
+	for _, m := range modals {
+		if strings.Contains(content, m) {
+			return m, true
+		}
+	}
+	return "", false
 }
